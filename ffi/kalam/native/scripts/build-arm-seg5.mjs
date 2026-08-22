@@ -2,6 +2,23 @@
 
 /* eslint-disable */
 
+/**
+ * Kalam.dylib built with older Go toolchains carries chained-fixups
+ * metadata with an incorrect seg_count (4 instead of 5). macOS 27
+ * (Golden Gate) and newer refuses to dlopen() such a mismatched dylib:
+ *   "chained fixups, seg_count does not match number of segments"
+ * Tahoe (26) doesn't hit this crash, but this script targets macOS >=26
+ * anyway.
+ * Go >=1.26 generates the correct seg_count natively -- no binary
+ * patching involved here. This script checks the active `go` toolchain
+ * version before building and refuses to run on an older Go that would
+ * reproduce the bug.
+ *
+ * Original file: ./build.mjs -- keep this file in sync with it manually.
+ * Run this file the same way, from the project root:
+ *   zx ./ffi/kalam/native/scripts/build-arm-seg5.mjs
+ */
+
 import 'zx/globals';
 import fs from 'fs-extra';
 import { packageDirectory } from 'pkg-dir';
@@ -21,95 +38,63 @@ const BUILD_BASE_DIR = `${PKG_ROOT_DIR}/build`;
 
 const orangeChalk = chalk.bold.hex('#FFA500');
 
-// find the brew bottle hashes here: https://github.com/Homebrew/homebrew-core/blob/master/Formula/libusb.rb
-const libusbBrewBottles = {
-  d9121e56c7dbfad640c9f8e3c3cc621d88404dc1047a4a7b7c82fe06193bca1f: {
-    sha256: `d9121e56c7dbfad640c9f8e3c3cc621d88404dc1047a4a7b7c82fe06193bca1f`,
-    customFilePath: null, // null | {shouldProcessLibusbDylibConfig: boolean, shouldProcessPkgConfig: boolean, url: string }
-    historicity: null,
-    arch: `arm64`,
-    os: `darwin`,
-    osName: `mac`,
-    osVersion: `big_sur`,
-    libusbVersion: `1.0.26`,
-  },
-  '1318e1155192bdaf7d159562849ee8f73cb0f59b0cb77c142f8be99056ba9d9e': {
-    sha256: `1318e1155192bdaf7d159562849ee8f73cb0f59b0cb77c142f8be99056ba9d9e`,
-    customFilePath: null, // null | {shouldProcessLibusbDylibConfig: boolean, shouldProcessPkgConfig: boolean, url: string }
-    historicity: null,
-    arch: `amd64`,
-    os: `darwin`,
-    osName: `mac`,
-    osVersion: `mojave`,
-    libusbVersion: `1.0.24`,
-  },
-};
+// the minimum Go toolchain version that generates correct chained-fixups
+// seg_count metadata (fixes the macOS 27+ dlopen crash) without needing
+// any post-build patching
+const MIN_GO_VERSION = { major: 1, minor: 26 };
 
-/**
- *  macOS version below Catalina (10.15) are classified as historical OSes
-Support for these older version of the oses are now being deprecated because for OpenMTP to keep supporting these OSes, kernel dylibs needs to compiled on such older versions of macOS which is practically very difficult thing to do.
-Usually the compilation of the kernel dylibs on these older OSes happen very rarely and only when there is a security issue or something.
-The dylib files compiled against these older versions (historical versions) of macos are built into the directories: `build/mac/bin/medieval`
-Compiling dylibs on the historical macos versions doesn't overwrite builds in the `build/mac/bin/arm64/` or `build/mac/bin/amd64/` which contains the dylibs for the latest and supported versions of macos
- */
+async function checkGoVersion() {
+  const raw = (await $`go version`).stdout.trim();
+  const match = raw.match(/go(\d+)\.(\d+)(?:\.(\d+))?/);
 
-// To support macOS version below Big Sur the Kalam kernel needs to be compiled on an older macOS machine everytime there is an update, which is practically very difficult.
-// So any version included in the [KALAM_HISTORIC_VERSION_TYPE] will not receive the latest Kalam Kernel updates
-export const KALAM_HISTORIC_VERSION_TYPE = {
-  medieval: 'medieval', // macOS 10.14 (Mojave) and 10.15 (Catalina). libusb support is still available but since it requires Mojave or lower to compile the kernel, it is being deprecated.
-};
+  if (!match) {
+    throw new Error(`could not parse the Go version from: "${raw}"`);
+  }
 
-// if the user's os version is higher than the ones listed here then latest kalam kernel binaies will be used
-// reference: https://github.com/npm/node-semver#ranges
-export const KALAM_HISTORIC_MACOS_VERSION_RANGE = {
-  [KALAM_HISTORIC_VERSION_TYPE.medieval]: `>=10.14 <=10.15.999`,
-};
+  const major = Number(match[1]);
+  const minor = Number(match[2]);
 
-let isBuildingOnAHistoricMacOs = false;
+  const isNewEnough =
+    major > MIN_GO_VERSION.major ||
+    (major === MIN_GO_VERSION.major && minor >= MIN_GO_VERSION.minor);
 
-const historicalLibusbBrewBottles = {
-  '1318e1155192bdaf7d159562849ee8f73cb0f59b0cb77c142f8be99056ba9d9e': {
-    sha256: `1318e1155192bdaf7d159562849ee8f73cb0f59b0cb77c142f8be99056ba9d9e`,
-    customFilePath: null, // null | {shouldProcessLibusbDylibConfig: boolean, shouldProcessPkgConfig: boolean, url: string }
-    isForHistoricMacos: true,
-    historicity: {
-      buildDir: KALAM_HISTORIC_VERSION_TYPE.medieval,
-    },
-    arch: `amd64`,
-    os: `darwin`,
-    osName: `mac`,
-    osVersion: `mojave`,
-    libusbVersion: `1.0.24`,
-  },
-};
-
-function buildCompatibilityChecks() {
-  if (macosVersion.is('<10.14')) {
+  if (!isNewEnough) {
     throw new Error(
-      'To build the Kalam dylib files at least macOS >=10.14 is required'
+      `Go ${MIN_GO_VERSION.major}.${MIN_GO_VERSION.minor}+ is required to build a correctly-formed arm64 kalam.dylib (found "${raw}"). Upgrade Go and try again.`
     );
   }
 
-  for (const [, value] of Object.entries(KALAM_HISTORIC_MACOS_VERSION_RANGE)) {
-    if (macosVersion.is(value)) {
-      isBuildingOnAHistoricMacOs = true;
-
-      console.info(
-        orangeChalk(`This is a historical version of macOS.
-macOS version below Catalina (10.15) are classified as historical OSes
-Support for these older version of the oses are now being deprecated because for OpenMTP to keep supporting these OSes, kernel dylibs needs to compiled on such older versions of macOS which is practically very difficult thing to do.
-Usually the compilation of the kernel dylibs on these older OSes happen very rarely and only when there is a security issue or something.
-The dylib files compiled against these older versions (historical versions) of macos are built into the directories: 'build/mac/bin/medieval'
-Compiling dylibs on the historical macos versions doesn't overwrite builds in the 'build/mac/bin/arm64/' or 'build/mac/bin/amd64/' which contains the dylibs for the latest and supported versions of macos
-      `)
-      );
-
-      break;
-    }
-  }
+  console.info(
+    orangeChalk(
+      `using ${raw} (>= go${MIN_GO_VERSION.major}.${MIN_GO_VERSION.minor} required) -- ok\n`
+    )
+  );
 }
 
-buildCompatibilityChecks();
+await checkGoVersion();
+
+// find the brew bottle hashes here: https://github.com/Homebrew/homebrew-core/blob/main/Formula/lib/libusb.rb
+// arm64_tahoe only -- libusb 1.0.30
+const libusbBrewBottles = {
+  '184daaa6108f0a56eb72c58cc4124dbbb0b54a655632dffdf8334569d71e2a34': {
+    sha256: `184daaa6108f0a56eb72c58cc4124dbbb0b54a655632dffdf8334569d71e2a34`,
+    customFilePath: null, // null | {shouldProcessLibusbDylibConfig: boolean, shouldProcessPkgConfig: boolean, url: string }
+    arch: `arm64`,
+    os: `darwin`,
+    osName: `mac`,
+    osVersion: `tahoe`,
+    libusbVersion: `1.0.30`,
+  },
+};
+
+// Go >=1.26 itself does not run on macOS below 12 (Monterey) -- this is a
+// build-host requirement, unlike the general ./build.mjs which only needs
+// macOS >=10.14 since it supports older Go toolchains too.
+if (macosVersion.is('<12')) {
+  throw new Error(
+    `This script requires Go >=${MIN_GO_VERSION.major}.${MIN_GO_VERSION.minor}, which does not run on macOS versions below 12 (Monterey). Build on a machine running macOS >=12.`
+  );
+}
 
 async function getCmd(cmd) {
   const op = await $`${cmd}`;
@@ -123,9 +108,9 @@ function getBottlePath({ prefix, bottle }) {
 
 function getLibusbBottleCachePath({ bottle }) {
   const libusbFullFileName = `libusb-1.0.0.dylib`;
-  const libusbCleanedFileName = `libusb.dylib`;
-  const kalamFileName = `kalam.dylib`;
-  const kalamDebugReportFileName = `kalam_debug_report`;
+  const libusbCleanedFileName = `libusb-seg5.dylib`;
+  const kalamFileName = `kalam-seg5.dylib`;
+  const kalamDebugReportFileName = `kalam_debug_report-seg5`;
 
   const identifier = getBottlePath({ prefix: 'libusb', bottle });
   const tarball = `${LIBUSB_BOTTLE_TEMP_DIR}/${identifier}.tar.gz`;
@@ -135,12 +120,9 @@ function getLibusbBottleCachePath({ bottle }) {
   const pkgConfigPrefix = `${extracted}`;
   const libusbDylib = `${extracted}/libusb/${bottle.libusbVersion}/lib/${libusbFullFileName}`;
 
-  let buildDir;
-  if (bottle.historicity) {
-    buildDir = `${BUILD_BASE_DIR}/${bottle.osName}/bin/${bottle.historicity.buildDir}/${bottle.arch}`;
-  } else {
-    buildDir = `${BUILD_BASE_DIR}/${bottle.osName}/bin/${bottle.arch}`;
-  }
+  // same directory as the normal arm64 build -- only the filenames differ,
+  // so this never collides with the existing kalam.dylib/libusb.dylib
+  const buildDir = `${BUILD_BASE_DIR}/${bottle.osName}/bin/${bottle.arch}`;
 
   const libusbDylibInBuildDir = `${buildDir}/${libusbCleanedFileName}`;
   const kalamDylibInBuildDir = `${buildDir}/${kalamFileName}`;
@@ -249,7 +231,7 @@ async function runPrerequisites({ bottles }) {
     }
 
     if (bottle.customFilePath?.shouldProcessLibusbDylibConfig !== false) {
-      // copying the libusb-1.0.0.dylib to the build directory
+      // copying the libusb-1.0.0.dylib to the build directory (as libusb-seg5.dylib)
       console.info(
         `[${bottlePath.identifier}] attempting to copy the libusb-1.0.0.dylib to the build directory...\n`
       );
@@ -260,7 +242,8 @@ async function runPrerequisites({ bottles }) {
         bottlePath.libusbDylibInBuildDir
       );
 
-      // fixing the rpath in the libusb-1.0.0.dylib
+      // fixing the rpath in the libusb-1.0.0.dylib so kalam-seg5.dylib
+      // ends up referring to '@loader_path/libusb-seg5.dylib'
       console.info(
         `[${bottlePath.identifier}] fixing the rpath in the libusb-1.0.0.dylib...\n`
       );
@@ -278,25 +261,13 @@ async function runPrerequisites({ bottles }) {
   await $`sleep 1`;
 }
 
-let chosenBottlesForBuilding;
-// building binaries on and for the latest and supported macos versions
-if (!isBuildingOnAHistoricMacOs) {
-  chosenBottlesForBuilding = libusbBrewBottles;
+await runPrerequisites({ bottles: libusbBrewBottles });
 
-  await runPrerequisites({ bottles: chosenBottlesForBuilding });
-}
-// building binaries on and for the historical and deprecated macos versions
-else {
-  chosenBottlesForBuilding = historicalLibusbBrewBottles;
-
-  await runPrerequisites({ bottles: chosenBottlesForBuilding });
-}
-
-for await (const [, bottle] of Object.entries(chosenBottlesForBuilding)) {
+for await (const [, bottle] of Object.entries(libusbBrewBottles)) {
   const bottlePath = getLibusbBottleCachePath({ bottle });
 
   // building kalam
-  console.info(`building kalam...\n`);
+  console.info(`building kalam (seg5)...\n`);
   await $`(
   cd ${KALAM_NATIVE_DIR} && CGO_ENABLED=1 \
         PKG_CONFIG_PATH=${bottlePath.pkgconfigBaseDir} \
@@ -308,7 +279,7 @@ for await (const [, bottle] of Object.entries(chosenBottlesForBuilding)) {
         )`;
 
   // building kalam_debug_report
-  console.info(`building kalam_debug_report...\n`);
+  console.info(`building kalam_debug_report (seg5)...\n`);
   await $`(
   cd ${KALAM_NATIVE_DIR} && CGO_ENABLED=1 \
         PKG_CONFIG_PATH=${bottlePath.pkgconfigBaseDir} \
@@ -322,6 +293,6 @@ for await (const [, bottle] of Object.entries(chosenBottlesForBuilding)) {
 
 console.warn(
   orangeChalk(
-    `\nBuilding arm64 for macOS 26 Tahoe and newer? Use the separate script instead, run from the project root:\n\n  zx ./ffi/kalam/native/scripts/build-arm-seg5.mjs\n(the dlopen crash itself only hits macOS 27 Golden Gate and newer, but Tahoe builds with the same fixed binary so it's already covered ahead of that upgrade)\n`
+    `\nNOTE: standalone, focused variant of ./build.mjs (same directory).\n\n- Scope: arm64 only, built with Go ${MIN_GO_VERSION.major}.${MIN_GO_VERSION.minor}+\n- Output files use the '-seg5' suffix\n- They live in the same build/mac/bin/arm64/ directory, alongside (not replacing) the existing kalam.dylib / libusb.dylib / kalam_debug_report\n- If you change one of these two files, check whether the other needs the same change\n`
   )
 );

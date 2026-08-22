@@ -2143,6 +2143,10 @@ class FileExplorer extends Component {
                 </Tooltip>
               ))}
             </div>
+
+            <Typography className={styles.nextReleaseTitle}>
+              {`The all-new, next-generation ${APP_NAME} is coming soon, with new features and big improvements to overall stability and performance. Thanks for all your support - stay tuned!`}
+            </Typography>
           </div>
         </ProgressBarDialog>
         <ConfirmDialog
